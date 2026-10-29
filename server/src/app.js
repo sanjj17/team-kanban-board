@@ -1,4 +1,6 @@
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -50,11 +52,45 @@ const schemas = {
   comment: z.object({ body: z.string().trim().min(1, 'Comment cannot be empty.').max(1000) }).strict(),
 };
 
-function createApp({ db, jwtSecret = process.env.JWT_SECRET || 'dev-only-change-me' }) {
+/**
+ * Tiny in-memory rate limiter (per client IP). Enough to slow down password guessing
+ * without adding a dependency. A multi-instance deployment would use a shared store.
+ */
+function createRateLimiter({ windowMs, max }) {
+  const hits = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    if (hits.size > 5000) {
+      for (const [key, entry] of hits) if (entry.resetAt <= now) hits.delete(key);
+    }
+    const key = req.ip || 'unknown';
+    let entry = hits.get(key);
+    if (!entry || entry.resetAt <= now) {
+      entry = { count: 0, resetAt: now + windowMs };
+      hits.set(key, entry);
+    }
+    entry.count += 1;
+    if (entry.count > max) {
+      res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: 'Too many attempts. Please wait a few minutes and try again.' });
+    }
+    return next();
+  };
+}
+
+function createApp({
+  db,
+  jwtSecret = process.env.JWT_SECRET || 'dev-only-change-me',
+  authRateLimit = { windowMs: 15 * 60 * 1000, max: 40 },
+  trustProxy = false,
+  clientDist = path.resolve(__dirname, '../../client/dist'),
+}) {
   if (!db) throw new Error('createApp requires a database connection.');
   const app = express();
   app.disable('x-powered-by');
+  if (trustProxy) app.set('trust proxy', 1);
   app.use(express.json({ limit: '100kb' }));
+  const authLimiter = createRateLimiter(authRateLimit);
 
   const statements = {
     userById: db.prepare('SELECT id, name, email FROM users WHERE id = ?'),
@@ -147,11 +183,10 @@ function createApp({ db, jwtSecret = process.env.JWT_SECRET || 'dev-only-change-
       labels: JSON.parse(card.labels || '[]'),
     };
   }
-
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
   // Authentication
-  app.post('/api/auth/register', async (req, res, next) => {
+  app.post('/api/auth/register', authLimiter, async (req, res, next) => {
     const input = validate(schemas.register, req.body, res);
     if (!input) return;
     try {
@@ -168,7 +203,7 @@ function createApp({ db, jwtSecret = process.env.JWT_SECRET || 'dev-only-change-
     }
   });
 
-  app.post('/api/auth/login', async (req, res, next) => {
+  app.post('/api/auth/login', authLimiter, async (req, res, next) => {
     const input = validate(schemas.login, req.body, res);
     if (!input) return;
     try {
@@ -422,23 +457,32 @@ function createApp({ db, jwtSecret = process.env.JWT_SECRET || 'dev-only-change-
     }
     const updates = [];
     const values = [];
+    const changed = [];
     const fieldMap = { title: 'title', description: 'description', assigneeId: 'assignee_id', dueDate: 'due_date' };
+    const fieldLabel = { title: 'title', description: 'description', assigneeId: 'assignee', dueDate: 'due date' };
     for (const [key, column] of Object.entries(fieldMap)) {
-      if (Object.prototype.hasOwnProperty.call(input, key)) {
+      if (Object.prototype.hasOwnProperty.call(input, key) && input[key] !== card[column]) {
         updates.push(`${column} = ?`);
         values.push(input[key]);
+        changed.push(fieldLabel[key]);
       }
     }
     if (Object.prototype.hasOwnProperty.call(input, 'labels')) {
-      updates.push('labels = ?');
-      values.push(JSON.stringify(input.labels));
+      const nextLabels = JSON.stringify(input.labels);
+      if (nextLabels !== (card.labels || '[]')) {
+        updates.push('labels = ?');
+        values.push(nextLabels);
+        changed.push('labels');
+      }
     }
+    // Nothing actually changed: don't touch the row or spam the activity log.
+    if (updates.length === 0) return res.json({ ok: true, changed: [] });
     updates.push("updated_at = datetime('now')");
     values.push(cardId, req.projectId);
     db.prepare(`UPDATE cards SET ${updates.join(', ')} WHERE id = ? AND project_id = ?`).run(...values);
     const newTitle = input.title || card.title;
-    logActivity(req.projectId, req.user.id, `${req.user.name} updated ${newTitle}`, cardId);
-    res.json({ ok: true });
+    logActivity(req.projectId, req.user.id, `${req.user.name} updated ${newTitle} (${changed.join(', ')})`, cardId);
+    res.json({ ok: true, changed });
   });
 
   app.post('/api/projects/:projectId/cards/:cardId/move', authenticate, requireProjectMember, (req, res) => {
@@ -458,18 +502,25 @@ function createApp({ db, jwtSecret = process.env.JWT_SECRET || 'dev-only-change-
       insertionIndex = destination.findIndex((item) => item.id === input.beforeCardId);
       if (insertionIndex < 0) return res.status(400).json({ error: 'The destination card is not in that column.' });
     }
-    const oldPositions = destination.map((item) => item.position);
-    const newPosition = positionBetween(destination, insertionIndex);
-    // In the extremely rare precision fallback, persist any rebalanced destination neighbours.
-    destination.forEach((item, index) => {
-      if (item.position !== oldPositions[index]) {
-        db.prepare('UPDATE cards SET position = ? WHERE id = ?').run(item.position, item.id);
-      }
+    // Compute the new position and apply it atomically, so a crash can never leave a half-moved card.
+    const applyMove = db.transaction(() => {
+      const oldPositions = destination.map((item) => item.position);
+      const newPosition = positionBetween(destination, insertionIndex);
+      // In the extremely rare precision fallback, persist the compacted destination column only.
+      destination.forEach((item, index) => {
+        if (item.position !== oldPositions[index]) {
+          db.prepare('UPDATE cards SET position = ? WHERE id = ?').run(item.position, item.id);
+        }
+      });
+      db.prepare("UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ?")
+        .run(input.targetColumnId, newPosition, cardId, req.projectId);
+      const message = oldColumn.id === targetColumn.id
+        ? `${req.user.name} reordered ${card.title} in ${targetColumn.name}`
+        : `${req.user.name} moved ${card.title} from ${oldColumn.name} to ${targetColumn.name}`;
+      logActivity(req.projectId, req.user.id, message, cardId);
+      return newPosition;
     });
-    db.prepare("UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now') WHERE id = ? AND project_id = ?")
-      .run(input.targetColumnId, newPosition, cardId, req.projectId);
-    const title = card.title;
-    logActivity(req.projectId, req.user.id, `${req.user.name} moved ${title} from ${oldColumn.name} to ${targetColumn.name}`, cardId);
+    const newPosition = applyMove();
     res.json({ ok: true, cardId, columnId: input.targetColumnId, position: newPosition });
   });
 
@@ -509,6 +560,15 @@ function createApp({ db, jwtSecret = process.env.JWT_SECRET || 'dev-only-change-
       .get(Number(result.lastInsertRowid));
     res.status(201).json({ comment });
   });
+
+  // Production: serve the built React app from the same origin as the API.
+  const hasClientBuild = fs.existsSync(path.join(clientDist, 'index.html'));
+  if (hasClientBuild) {
+    app.use(express.static(clientDist));
+    app.get(/^\/(?!api\/).*/, (_req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+  } else {
+    app.get('/', (_req, res) => res.json({ name: 'Orbit Kanban API', ok: true, health: '/api/health' }));
+  }
 
   app.use((_req, res) => res.status(404).json({ error: 'That endpoint does not exist.' }));
   app.use((error, _req, res, _next) => {
