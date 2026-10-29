@@ -26,4 +26,4 @@ function positionBetween(items, beforeIndex) {
   return newPrevious + (newNext - newPrevious) / 2;
 }
 
-module.exports = { POSITION_GAP, positionBetween };
+module.exports = { POSITION_GAP, MIN_GAP, positionBetween };
