@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*.local
+server/data/*.sqlite
+server/data/*.sqlite-shm
+server/data/*.sqlite-wal
+client/dist/
+coverage/
+.DS_Store
