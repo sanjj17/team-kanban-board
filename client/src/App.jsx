@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Activity, ArrowDownUp, ArrowRight, Bell, CalendarDays, Check, CheckCircle2,
+  Activity, ArrowDownUp, ArrowRight, CalendarDays, Check, CheckCircle2,
   ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Clock3, Columns3,
   Command, FolderKanban, LayoutGrid, ListFilter, LockKeyhole, LogOut, Mail,
   MessageCircle, MoreHorizontal, Plus, Search,
@@ -25,6 +25,20 @@ async function api(path, options = {}) {
     throw error;
   }
   return payload;
+}
+
+const POLL_INTERVAL_MS = 4000;
+
+/** Today's date as YYYY-MM-DD in the user's own timezone (toISOString would use UTC and be wrong near midnight). */
+function todayLocal() {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+/** A card is overdue when its due date has passed and it is not in the "Done" column. */
+function isOverdue(dueDate, columnName) {
+  return Boolean(dueDate) && dueDate < todayLocal() && columnName.trim().toLowerCase() !== 'done';
 }
 
 function prettyDate(value) {
@@ -99,7 +113,14 @@ function AuthScreen({ onAuth, toast, onToastClose }) {
     setError('');
     setBusy(true);
     try {
-      const result = await api(mode === 'login' ? '/auth/login' : '/auth/register', { method: 'POST', body: form });
+      const payload = mode === 'login'
+  ? { email: form.email, password: form.password }
+  : form;
+
+const result = await api(
+  mode === 'login' ? '/auth/login' : '/auth/register',
+  { method: 'POST', body: payload }
+);
       onAuth(result);
     } catch (err) {
       setError(err.message);
@@ -149,15 +170,15 @@ function AuthScreen({ onAuth, toast, onToastClose }) {
   </div>;
 }
 
-function Card({ card, column, onOpen, onDragStart, onDragEnd, onDrop, isDragging }) {
-  const isOverdue = card.dueDate && card.dueDate < new Date().toISOString().slice(0, 10) && column.name.toLowerCase() !== 'done';
-  return <article className={`task-card ${isDragging ? 'task-dragging' : ''}`} draggable onDragStart={(event) => onDragStart(event, card, column)} onDragEnd={onDragEnd} onDragOver={(event) => event.preventDefault()} onDrop={(event) => onDrop(event, column, card)} onClick={() => onOpen(card, column.id)}>
-    <div className="task-topline"><span className="task-grip" aria-label="Drag task"><span /><span /><span /><span /><span /><span /></span><button className="task-menu" aria-label={`Open ${card.title}`} onClick={(event) => { event.stopPropagation(); onOpen(card, column.id); }}><MoreHorizontal size={17} /></button></div>
+function Card({ card, column, onOpen, onDragStart, onDragEnd, onDrop, onGripPointerDown, isDragging, dropBefore, coarsePointer }) {
+  const overdue = isOverdue(card.dueDate, column.name);
+  return <article data-card-id={card.id} className={`task-card ${isDragging ? 'task-dragging' : ''} ${dropBefore ? 'drop-before' : ''}`} draggable={!coarsePointer} onDragStart={(event) => onDragStart(event, card, column)} onDragEnd={onDragEnd} onDragOver={(event) => event.preventDefault()} onDrop={(event) => onDrop(event, column, card)} onClick={() => onOpen(card, column.id)}>
+    <div className="task-topline"><span className="task-grip" role="button" aria-label={`Drag ${card.title}`} title="Drag to move" onPointerDown={(event) => onGripPointerDown(event, card, column)} onClick={(event) => event.stopPropagation()}><span /><span /><span /><span /><span /><span /></span><button className="task-menu" aria-label={`Open ${card.title}`} onClick={(event) => { event.stopPropagation(); onOpen(card, column.id); }}><MoreHorizontal size={17} /></button></div>
     <h3>{card.title}</h3>
     {card.description && <p className="task-description">{card.description}</p>}
     {card.labels?.length > 0 && <div className="task-labels">{card.labels.slice(0, 3).map((label) => <Label key={label}>{label}</Label>)}{card.labels.length > 3 && <span className="more-labels">+{card.labels.length - 3}</span>}</div>}
     <div className="task-footer">
-      <div className={`task-due ${isOverdue ? 'overdue' : ''}`}>{card.dueDate && <><CalendarDays size={13} /><span>{prettyDate(card.dueDate)}</span></>}{isOverdue && <span className="overdue-mark">!</span>}</div>
+      <div className={`task-due ${overdue ? 'overdue' : ''}`}>{card.dueDate && <><CalendarDays size={13} /><span>{prettyDate(card.dueDate)}</span></>}{overdue && <span className="overdue-mark">!</span>}</div>
       <div className="task-meta"><span className="comment-count" title={`${card.commentCount || 0} comments`}><MessageCircle size={14} />{card.commentCount || 0}</span>{card.assigneeName ? <Avatar name={card.assigneeName} size="small" title={`Assigned to ${card.assigneeName}`} /> : <span className="unassigned-avatar" title="Unassigned">?</span>}</div>
     </div>
   </article>;
@@ -209,6 +230,64 @@ function Modal({ children, onClose, wide = false }) {
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`modal ${wide ? 'modal-wide' : ''}`} role="dialog" aria-modal="true">{children}</section></div>;
 }
 
+function ColumnModal({ mode, column, onClose, onSubmit, onDelete }) {
+  const [name, setName] = useState(column?.name || '');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [confirming, setConfirming] = useState(false);
+  const cardCount = column?.cards.length || 0;
+  async function submit(event) {
+    event.preventDefault(); setError(''); setBusy(true);
+    try { await onSubmit(name.trim()); onClose(); }
+    catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  }
+  async function remove() {
+    setError(''); setBusy(true);
+    try { await onDelete(); onClose(); }
+    catch (err) { setError(err.message); setConfirming(false); }
+    finally { setBusy(false); }
+  }
+  return <Modal onClose={onClose}>
+    <div className="modal-header"><div className="modal-icon icon-purple"><Columns3 size={19} /></div><div><h2>{mode === 'add' ? 'Add a column' : 'Edit column'}</h2><p>{mode === 'add' ? 'Shape your workflow.' : 'Rename it, or remove it once it is empty.'}</p></div><button className="icon-button modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button></div>
+    {error && <div className="inline-error"><CircleAlert size={15} />{error}</div>}
+    <form className="modal-form" onSubmit={submit}>
+      <label>Column name<input autoFocus maxLength={40} minLength={2} required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. In review" /></label>
+      <div className="modal-actions"><button className="secondary-button" type="button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || name.trim().length < 2}>{busy ? 'Saving…' : mode === 'add' ? 'Add column' : 'Save name'} <Check size={16} /></button></div>
+    </form>
+    {mode === 'edit' && <>
+      <div className="form-divider"><span>DANGER ZONE</span></div>
+      {cardCount > 0
+        ? <p className="form-note">This column still has {cardCount} {cardCount === 1 ? 'task' : 'tasks'}. Move or delete them first, then you can delete the column.</p>
+        : confirming
+          ? <div className="confirm-delete"><div><strong>Delete “{column.name}”?</strong><p>The column is empty. This cannot be undone.</p></div><button className="secondary-button" onClick={() => setConfirming(false)}>Keep it</button><button className="danger-button" disabled={busy} onClick={remove}>Delete</button></div>
+          : <button type="button" className="danger-quiet" onClick={() => setConfirming(true)}><Trash2 size={15} /> Delete column</button>}
+    </>}
+  </Modal>;
+}
+
+function ConfirmModal({ title, message, confirmLabel = 'Confirm', onConfirm, onClose }) {
+  const [busy, setBusy] = useState(false);
+  async function confirm() { setBusy(true); try { await onConfirm(); } finally { setBusy(false); onClose(); } }
+  return <Modal onClose={onClose}>
+    <div className="modal-header"><div className="modal-icon icon-purple"><CircleAlert size={19} /></div><div><h2>{title}</h2><p>{message}</p></div></div>
+    <div className="modal-actions"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="danger-button" disabled={busy} onClick={confirm}>{confirmLabel}</button></div>
+  </Modal>;
+}
+
+function HelpModal({ onClose, coarsePointer }) {
+  return <Modal onClose={onClose}>
+    <div className="modal-header"><div className="modal-icon icon-mint"><Sparkles size={19} /></div><div><h2>Quick tips</h2><p>Everything you need to get moving.</p></div><button className="icon-button modal-close" aria-label="Close" onClick={onClose}><X size={18} /></button></div>
+    <ul className="help-list">
+      <li><strong>Move a card.</strong> {coarsePointer ? 'Press and hold the dotted handle at the top-left of a card, then drag it. The board scrolls when you reach an edge.' : 'Drag a card onto another card or column. Its order is saved on the server.'}</li>
+      <li><strong>Edit details.</strong> Tap a card (or its ⋯ button) to change the title, assignee, due date and labels, or to comment.</li>
+      <li><strong>Stay in sync.</strong> The board refreshes by itself every few seconds, so teammates’ changes appear without reloading.</li>
+      <li><strong>Owners</strong> can invite people, remove them, and add, rename or reorder columns.</li>
+    </ul>
+    <div className="modal-actions"><button className="primary-button" onClick={onClose}>Got it</button></div>
+  </Modal>;
+}
+
 function CardModal({ card, projectId, defaultColumnId, columns, members, onClose, onSaved, notify }) {
   const [form, setForm] = useState({
     title: card?.title || '', description: card?.description || '',
@@ -224,7 +303,13 @@ function CardModal({ card, projectId, defaultColumnId, columns, members, onClose
 
   useEffect(() => {
     if (!card?.id) return;
-    api(`/projects/${projectId}/cards/${card.id}/comments`).then((data) => setComments(data.comments)).catch((err) => notify(err.message, 'error'));
+    let cancelled = false;
+    const load = (quiet) => api(`/projects/${projectId}/cards/${card.id}/comments`)
+      .then((data) => { if (!cancelled) setComments((previous) => (JSON.stringify(previous) === JSON.stringify(data.comments) ? previous : data.comments)); })
+      .catch((err) => { if (!quiet && !cancelled) notify(err.message, 'error'); });
+    load(false);
+    const timer = setInterval(() => { if (!document.hidden) load(true); }, 5000);
+    return () => { cancelled = true; clearInterval(timer); };
   }, [card?.id, projectId, notify]);
 
   async function submit(event) {
@@ -301,6 +386,7 @@ function TeamModal({ projectId, board, onClose, onRefresh, notify }) {
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState('');
   const [error, setError] = useState('');
+  const [memberToRemove, setMemberToRemove] = useState(null);
   async function invite(event) {
     event.preventDefault(); setError(''); setInviteBusy(true); setInviteLink('');
     try {
@@ -312,13 +398,12 @@ function TeamModal({ projectId, board, onClose, onRefresh, notify }) {
     finally { setInviteBusy(false); }
   }
   async function removeMember(member) {
-    if (!window.confirm(`Remove ${member.name} from this project?`)) return;
     try { await api(`/projects/${projectId}/members/${member.id}`, { method: 'DELETE' }); await onRefresh(); notify(`${member.name} was removed.`); }
     catch (err) { notify(err.message, 'error'); }
   }
-  return <Modal onClose={onClose}>
+  return <><Modal onClose={onClose}>
     <div className="modal-header"><div className="modal-icon icon-mint"><Users size={19} /></div><div><h2>Team members</h2><p>Good work is a team sport.</p></div><button className="icon-button modal-close" onClick={onClose}><X size={18} /></button></div>
-    <div className="team-list">{board.members.map((member) => <div className="team-row" key={member.id}><Avatar name={member.name} /><div className="team-member-info"><strong>{member.name}</strong><span>{member.email}</span></div><span className={`role-pill ${member.role}`}>{member.role}</span>{board.role === 'owner' && member.role !== 'owner' && <button className="member-remove" title={`Remove ${member.name}`} onClick={() => removeMember(member)}><X size={15} /></button>}</div>)}</div>
+    <div className="team-list">{board.members.map((member) => <div className="team-row" key={member.id}><Avatar name={member.name} /><div className="team-member-info"><strong>{member.name}</strong><span>{member.email}</span></div><span className={`role-pill ${member.role}`}>{member.role}</span>{board.role === 'owner' && member.role !== 'owner' && <button className="member-remove" title={`Remove ${member.name}`} onClick={() => setMemberToRemove(member)}><X size={15} /></button>}</div>)}</div>
     {board.role === 'owner' && <>
       <div className="form-divider"><span>INVITE SOMEONE</span></div>
       <form className="invite-form" onSubmit={invite}><label>Email address<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="teammate@company.com" required maxLength={254} /></label><button className="primary-button" disabled={inviteBusy}>{inviteBusy ? 'Sending…' : 'Invite'} <UserPlus size={16} /></button></form>
@@ -327,7 +412,9 @@ function TeamModal({ projectId, board, onClose, onRefresh, notify }) {
       {inviteLink && <div className="invite-link-box"><div><strong>Invitation link ready</strong><p>Share this link with the invited person. It expires in 7 days.</p><input readOnly value={inviteLink} onFocus={(e) => e.target.select()} /></div><button className="secondary-button" onClick={() => { navigator.clipboard.writeText(inviteLink).then(() => notify('Invitation link copied.')).catch(() => notify('Select the link and copy it manually.', 'error')); }}><Command size={14} /> Copy link</button></div>}
       {board.pendingInvitations?.length > 0 && <div className="pending-invites"><strong>Pending invitations</strong>{board.pendingInvitations.map((invite) => <div key={invite.token}><Mail size={14} /><span>{invite.email}</span><button title="Copy invitation link" onClick={() => { const link = `${window.location.origin}/accept-invite/${invite.token}`; navigator.clipboard.writeText(link).then(() => notify('Invitation link copied.')).catch(() => window.prompt('Copy invitation link', link)); }}><Command size={14} /></button></div>)}</div>}
     </>}
-  </Modal>;
+  </Modal>
+  {memberToRemove && <ConfirmModal title={`Remove ${memberToRemove.name}?`} message="They will lose access to this project straight away. Their task assignments are cleared." confirmLabel="Remove" onClose={() => setMemberToRemove(null)} onConfirm={() => removeMember(memberToRemove)} />}
+  </>;
 }
 
 function App() {
@@ -352,8 +439,22 @@ function App() {
   const [onlyOverdue, setOnlyOverdue] = useState(false);
   const [draggingCard, setDraggingCard] = useState(null);
   const [columnsMenu, setColumnsMenu] = useState(false);
+  const [columnModal, setColumnModal] = useState(null); // { mode: 'add' } or { mode: 'edit', columnId }
+  const [showHelp, setShowHelp] = useState(false);
+  const [syncState, setSyncState] = useState('live'); // 'live' | 'offline'
+  const [touchDrag, setTouchDrag] = useState(null);
+  const coarsePointer = useMemo(() => Boolean(window.matchMedia?.('(pointer: coarse)').matches), []);
+  const boardRef = useRef(null);
+  const draggingRef = useRef(null);
+  const touchRef = useRef(null);
+  const busyRef = useRef(0); // writes in flight: polling pauses so it can never overwrite a fresh move
+  const boardSeq = useRef(0); // only the newest board request may update the screen
+  const lastBoardJson = useRef('');
+  const lastActivityJson = useRef('');
   const inviteToken = useMemo(() => window.location.pathname.match(/^\/accept-invite\/([a-f0-9]+)$/)?.[1] || null, []);
   const inviteHandled = useRef(false);
+  boardRef.current = board;
+  draggingRef.current = draggingCard;
   const notify = useCallback((message, type = 'success') => setToast({ message, type, stamp: Date.now() }), []);
   const closeToast = useCallback(() => setToast(null), []);
 
@@ -376,23 +477,66 @@ function App() {
   }, [user, notify]);
 
   const refreshBoard = useCallback(async (quiet = false) => {
-    if (!selectedProjectId || !user) { setBoard(null); return; }
+    if (!selectedProjectId || !user) { setBoard(null); lastBoardJson.current = ''; return; }
     if (!quiet) setLoadingBoard(true);
+    const seq = ++boardSeq.current;
     try {
       const data = await api(`/projects/${selectedProjectId}/board`);
-      setBoard(data);
+      if (seq !== boardSeq.current) return; // a newer request already answered
+      const json = JSON.stringify(data);
+      if (json !== lastBoardJson.current) { lastBoardJson.current = json; setBoard(data); }
+      setSyncState('live');
     } catch (err) { notify(err.message, 'error'); }
     finally { if (!quiet) setLoadingBoard(false); }
   }, [selectedProjectId, user, notify]);
 
   const refreshActivity = useCallback(async () => {
     if (!selectedProjectId || !user) { setActivity([]); return; }
-    try { const data = await api(`/projects/${selectedProjectId}/activity`); setActivity(data.activity); }
+    try {
+      const data = await api(`/projects/${selectedProjectId}/activity`);
+      const json = JSON.stringify(data.activity);
+      if (json !== lastActivityJson.current) { lastActivityJson.current = json; setActivity(data.activity); }
+    }
     catch (err) { notify(err.message, 'error'); }
   }, [selectedProjectId, user, notify]);
 
   useEffect(() => { if (user) refreshProjects(); else { setProjects([]); setSelectedProjectId(null); setBoard(null); } }, [user, refreshProjects]);
   useEffect(() => { if (user && selectedProjectId) { refreshBoard(); refreshActivity(); } else setBoard(null); }, [user, selectedProjectId, refreshBoard, refreshActivity]);
+
+  // Live updates: poll the server every few seconds (paused while the tab is hidden, a drag is
+  // active, or one of our own writes is in flight, so it can never fight the user's own move).
+  useEffect(() => {
+    if (!user || !selectedProjectId) return undefined;
+    let cancelled = false;
+    const isBusy = () => busyRef.current > 0 || Boolean(draggingRef.current) || Boolean(touchRef.current);
+    async function tick() {
+      if (document.hidden || isBusy()) return;
+      const seq = ++boardSeq.current;
+      try {
+        const [boardData, activityData, projectData] = await Promise.all([
+          api(`/projects/${selectedProjectId}/board`),
+          api(`/projects/${selectedProjectId}/activity`),
+          api('/projects'),
+        ]);
+        if (cancelled || seq !== boardSeq.current || isBusy()) return;
+        const boardJson = JSON.stringify(boardData);
+        if (boardJson !== lastBoardJson.current) { lastBoardJson.current = boardJson; setBoard(boardData); }
+        const activityJson = JSON.stringify(activityData.activity);
+        if (activityJson !== lastActivityJson.current) { lastActivityJson.current = activityJson; setActivity(activityData.activity); }
+        setProjects((previous) => (JSON.stringify(previous) === JSON.stringify(projectData.projects) ? previous : projectData.projects));
+        setSyncState('live');
+      } catch (err) {
+        if (cancelled) return;
+        if (err.status === 401) { localStorage.removeItem('kanban-token'); setToken(null); setUser(null); }
+        else if (err.status === 404) { notify('You no longer have access to that project.', 'error'); setSelectedProjectId(null); refreshProjects(); }
+        else setSyncState('offline');
+      }
+    }
+    const timer = setInterval(tick, POLL_INTERVAL_MS);
+    const onVisible = () => { if (!document.hidden) tick(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { cancelled = true; clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
+  }, [user, selectedProjectId, notify, refreshProjects]);
 
   useEffect(() => {
     if (!user || !token || !inviteToken || inviteHandled.current) return;
@@ -415,6 +559,7 @@ function App() {
   function logout() {
     localStorage.removeItem('kanban-token');
     setToken(null); setUser(null); setBoard(null); setActivity([]); setShowActivity(false); setShowTeam(false);
+    lastBoardJson.current = ''; lastActivityJson.current = '';
     notify('You have signed out.');
   }
 
@@ -431,14 +576,148 @@ function App() {
 
   async function moveCard(card, targetColumn, beforeCardId) {
     setDraggingCard(null);
-    if (!card || !targetColumn) return;
+    const current = boardRef.current;
+    if (!card || !targetColumn || !current) return;
+    const source = current.columns.find((column) => column.cards.some((item) => item.id === card.id));
+    if (!source) return;
+    if (source.id === targetColumn.id) {
+      const ids = source.cards.map((item) => item.id);
+      const index = ids.indexOf(card.id);
+      if (beforeCardId === (ids[index + 1] ?? null) || beforeCardId === card.id) return; // dropped exactly where it already is
+    }
+    // Optimistic update: show the move instantly, then let the server's answer replace it.
+    const movingCard = source.cards.find((item) => item.id === card.id);
+    const optimistic = {
+      ...current,
+      columns: current.columns.map((column) => {
+        const without = column.cards.filter((item) => item.id !== card.id);
+        if (column.id !== targetColumn.id) return { ...column, cards: without };
+        const found = beforeCardId == null ? -1 : without.findIndex((item) => item.id === beforeCardId);
+        const at = found < 0 ? without.length : found;
+        return { ...column, cards: [...without.slice(0, at), movingCard, ...without.slice(at)] };
+      }),
+    };
+    busyRef.current += 1;
+    lastBoardJson.current = JSON.stringify(optimistic);
+    setBoard(optimistic);
     try {
       await api(`/projects/${selectedProjectId}/cards/${card.id}/move`, {
         method: 'POST', body: { targetColumnId: targetColumn.id, beforeCardId: beforeCardId ?? null },
       });
-      await refreshAll();
-    } catch (err) { notify(err.message, 'error'); await refreshBoard(true); }
+    } catch (err) { notify(err.message, 'error'); }
+    finally { busyRef.current -= 1; }
+    await refreshAll(); // success: real positions; failure: rolls the card back
   }
+
+  // ---- Touch / pen dragging (HTML5 drag and drop does not fire on touch screens) ----
+  function startTouchDrag(event, card, column) {
+    if (event.pointerType === 'mouse') return; // mouse users use native drag and drop on the whole card
+    event.preventDefault(); event.stopPropagation();
+    const rect = event.currentTarget.closest('.task-card').getBoundingClientRect();
+    touchRef.current = { card, column, startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY, moved: false };
+    setDraggingCard({ card, column });
+    setTouchDrag({ title: card.title, x: event.clientX, y: event.clientY, width: Math.min(rect.width, 280), offsetX: Math.min(event.clientX - rect.left, 60), offsetY: 14, overColumnId: column.id, beforeCardId: undefined });
+  }
+
+  const touchActive = Boolean(touchDrag);
+  useEffect(() => {
+    if (!touchActive) return undefined;
+    document.body.classList.add('is-touch-dragging');
+
+    function resolveTarget(x, y) {
+      const drag = touchRef.current;
+      const currentBoard = boardRef.current;
+      const element = document.elementFromPoint(x, y);
+      const columnElement = element?.closest('[data-column-id]');
+      if (!drag || !currentBoard || !columnElement) return { columnId: null, beforeCardId: undefined };
+      const columnId = Number(columnElement.dataset.columnId);
+      const column = currentBoard.columns.find((item) => item.id === columnId);
+      if (!column) return { columnId: null, beforeCardId: undefined };
+      const remaining = column.cards.filter((item) => item.id !== drag.card.id);
+      const cardElement = element.closest('[data-card-id]');
+      const hoveredId = cardElement ? Number(cardElement.dataset.cardId) : null;
+      if (hoveredId && hoveredId !== drag.card.id) {
+        const index = remaining.findIndex((item) => item.id === hoveredId);
+        if (index >= 0) {
+          const rect = cardElement.getBoundingClientRect();
+          const after = y > rect.top + rect.height / 2;
+          return { columnId, beforeCardId: after ? (remaining[index + 1]?.id ?? null) : remaining[index].id };
+        }
+      }
+      // Over the gap between cards (or over the dragged card itself): insert before the first card whose middle is below the finger.
+      const next = [...columnElement.querySelectorAll('[data-card-id]')]
+        .filter((node) => Number(node.dataset.cardId) !== drag.card.id)
+        .find((node) => { const rect = node.getBoundingClientRect(); return y < rect.top + rect.height / 2; });
+      return { columnId, beforeCardId: next ? Number(next.dataset.cardId) : null };
+    }
+
+    function refreshTarget() {
+      const drag = touchRef.current;
+      if (!drag) return;
+      const target = resolveTarget(drag.x, drag.y);
+      setTouchDrag((previous) => previous && ({ ...previous, x: drag.x, y: drag.y, overColumnId: target.columnId, beforeCardId: target.beforeCardId }));
+    }
+
+    function onMove(event) {
+      const drag = touchRef.current;
+      if (!drag) return;
+      drag.x = event.clientX; drag.y = event.clientY;
+      if (Math.hypot(drag.x - drag.startX, drag.y - drag.startY) > 6) drag.moved = true;
+      refreshTarget();
+    }
+
+    function finish(event, cancelled) {
+      const drag = touchRef.current;
+      touchRef.current = null;
+      document.body.classList.remove('is-touch-dragging');
+      setTouchDrag(null);
+      if (!drag) return;
+      if (cancelled || !drag.moved) { setDraggingCard(null); return; }
+      drag.x = event.clientX; drag.y = event.clientY;
+      touchRef.current = drag; // resolveTarget reads it
+      const target = resolveTarget(drag.x, drag.y);
+      touchRef.current = null;
+      const column = boardRef.current?.columns.find((item) => item.id === target.columnId);
+      if (!column) { setDraggingCard(null); return; }
+      moveCard(drag.card, column, target.beforeCardId ?? null);
+    }
+    const onUp = (event) => finish(event, false);
+    const onCancel = (event) => finish(event, true);
+    const onKey = (event) => { if (event.key === 'Escape') finish(event, true); };
+
+    // Keep scrolling while the finger rests near an edge of the board or screen. The closer to the edge, the faster.
+    const EDGE = 64;
+    const speed = (distanceToEdge) => 2 + 8 * Math.min(1, Math.max(0, (EDGE - distanceToEdge) / EDGE));
+    const scroller = setInterval(() => {
+      const drag = touchRef.current;
+      if (!drag) return;
+      const area = document.querySelector('.board-scroll-area');
+      if (area) {
+        const rect = area.getBoundingClientRect();
+        if (drag.x < rect.left + EDGE) area.scrollLeft -= speed(drag.x - rect.left);
+        else if (drag.x > rect.right - EDGE) area.scrollLeft += speed(rect.right - drag.x);
+        if (drag.y < rect.top + EDGE) area.scrollTop -= speed(drag.y - rect.top);
+        else if (drag.y > rect.bottom - EDGE) area.scrollTop += speed(rect.bottom - drag.y);
+      }
+      if (drag.y < 110) window.scrollBy(0, -speed(drag.y - 46));
+      else if (drag.y > window.innerHeight - 70) window.scrollBy(0, speed(window.innerHeight - drag.y - 6));
+      refreshTarget();
+    }, 16);
+
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+    document.addEventListener('pointercancel', onCancel);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      clearInterval(scroller);
+      document.body.classList.remove('is-touch-dragging');
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      document.removeEventListener('pointercancel', onCancel);
+      document.removeEventListener('keydown', onKey);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [touchActive]);
 
   function handleCardDrop(event, targetColumn, targetCard = null) {
     event.preventDefault(); event.stopPropagation();
@@ -457,34 +736,29 @@ function App() {
 
   const allCards = useMemo(() => (board?.columns || []).flatMap((column) => column.cards.map((card) => ({ ...card, columnName: column.name }))), [board]);
   const allLabels = useMemo(() => [...new Set(allCards.flatMap((card) => card.labels || []))].sort((a, b) => a.localeCompare(b)), [allCards]);
-  const overdueCount = useMemo(() => allCards.filter((card) => card.dueDate && card.dueDate < new Date().toISOString().slice(0, 10) && card.columnName.toLowerCase() !== 'done').length, [allCards]);
+  const overdueCount = useMemo(() => allCards.filter((card) => isOverdue(card.dueDate, card.columnName)).length, [allCards]);
   const visibleCount = useMemo(() => allCards.filter((card) => {
-    const columnIsDone = card.columnName.toLowerCase() === 'done';
     if (search && !`${card.title} ${card.description}`.toLowerCase().includes(search.toLowerCase())) return false;
     if (filterAssignee !== 'all' && String(card.assigneeId || '') !== filterAssignee) return false;
     if (filterLabel !== 'all' && !(card.labels || []).includes(filterLabel)) return false;
-    if (onlyOverdue && !(card.dueDate && card.dueDate < new Date().toISOString().slice(0, 10) && !columnIsDone)) return false;
+    if (onlyOverdue && !isOverdue(card.dueDate, card.columnName)) return false;
     return true;
   }).length, [allCards, search, filterAssignee, filterLabel, onlyOverdue]);
 
-  async function addColumn() {
-    const name = window.prompt('Name your new column');
-    if (!name || !name.trim()) return;
-    try { await api(`/projects/${selectedProjectId}/columns`, { method: 'POST', body: { name: name.trim() } }); await refreshBoard(true); await refreshActivity(); notify('Column added.'); }
-    catch (err) { notify(err.message, 'error'); }
+  async function addColumn(name) {
+    await api(`/projects/${selectedProjectId}/columns`, { method: 'POST', body: { name } });
+    await refreshAll(); notify('Column added.');
   }
 
-  async function renameColumn(column) {
-    const name = window.prompt('Rename column', column.name);
-    if (!name || !name.trim() || name.trim() === column.name) return;
-    try { await api(`/projects/${selectedProjectId}/columns/${column.id}`, { method: 'PATCH', body: { name: name.trim() } }); await refreshAll(); notify('Column renamed.'); }
-    catch (err) { notify(err.message, 'error'); }
+  async function renameColumn(column, name) {
+    if (name === column.name) return;
+    await api(`/projects/${selectedProjectId}/columns/${column.id}`, { method: 'PATCH', body: { name } });
+    await refreshAll(); notify('Column renamed.');
   }
 
   async function deleteColumn(column) {
-    if (!window.confirm(`Delete the empty “${column.name}” column?`)) return;
-    try { await api(`/projects/${selectedProjectId}/columns/${column.id}`, { method: 'DELETE' }); await refreshAll(); notify('Column deleted.'); }
-    catch (err) { notify(err.message, 'error'); }
+    await api(`/projects/${selectedProjectId}/columns/${column.id}`, { method: 'DELETE' });
+    await refreshAll(); notify('Column deleted.');
   }
 
   async function nudgeColumn(index, direction) {
@@ -507,7 +781,6 @@ function App() {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand brand-sidebar"><span className="brand-mark"><Command size={19} strokeWidth={2.6} /></span><span>orbit<span className="brand-period">.</span></span><span className="workspace-badge">WORKSPACE</span></div>
-      <div className="workspace-switcher"><div className="workspace-avatar">O</div><div className="workspace-switch-text"><strong>Orbit Studio</strong><span>Free workspace</span></div><ChevronDown size={15} /></div>
       <nav className="sidebar-nav">
         <div className="nav-section-title">WORKSPACE <button className="tiny-add" onClick={() => setShowProjectModal(true)} title="Create project"><Plus size={14} /></button></div>
         <button className="nav-item active"><LayoutGrid size={17} /><span>Boards</span><span className="nav-count">{projects.length}</span></button>
@@ -527,7 +800,7 @@ function App() {
     </aside>
 
     <main className="main-content">
-      <header className="topbar"><div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><span className="crumb-current">Boards</span>{selectedProject && <><ChevronRight size={14} /><strong>{selectedProject.name}</strong></>}</div><div className="topbar-actions"><div className="secure-pill"><span /> All changes saved</div><button className="top-icon-button" onClick={() => setShowActivity(true)} title="Open activity"><Bell size={17} /><i /></button><button className="help-button" onClick={() => window.alert('Tip: drag a task card onto another card or column to move it. Open a card to edit details or add comments. Owners can manage the team and columns.')} title="Quick tips">?<span>Help</span></button></div></header>
+      <header className="topbar"><div className="breadcrumbs"><span>Workspace</span><ChevronRight size={14} /><span className="crumb-current">Boards</span>{selectedProject && <><ChevronRight size={14} /><strong>{selectedProject.name}</strong></>}</div><div className="topbar-actions"><div className={`secure-pill ${syncState === 'offline' ? 'secure-pill-offline' : ''}`} title={syncState === 'offline' ? 'Could not reach the server. Retrying…' : 'The board refreshes automatically every few seconds'}><span /> {syncState === 'offline' ? 'Reconnecting…' : 'Live'}</div><button className="help-button" onClick={() => setShowHelp(true)} title="Quick tips"><span>?</span><span>Help</span></button></div></header>
 
       {selectedProject && board ? <>
         <section className="board-intro">
@@ -535,7 +808,7 @@ function App() {
           <div className="board-title-actions"><div className="avatar-stack">{board.members.slice(0, 4).map((member) => <Avatar key={member.id} name={member.name} title={`${member.name} · ${member.role}`} />)}{board.members.length > 4 && <span className="avatar avatar-more">+{board.members.length - 4}</span>}</div><button className="secondary-button invite-short" onClick={() => setShowTeam(true)}><UserPlus size={15} /> Invite</button><span className="title-action-divider" /><button className={`outline-button ${showActivity ? 'outline-button-selected' : ''}`} onClick={() => setShowActivity(!showActivity)}><Activity size={15} /> Activity <span className="activity-live-dot" /></button><button className="primary-button create-task-top" onClick={() => { setNewCardColumnId(board.columns[0]?.id); setActiveCard(null); }}><Plus size={16} /> New task</button></div>
         </section>
 
-        <section className="board-toolbar"><div className="board-filters"><label className="search-box"><Search size={16} /><input aria-label="Search tasks" placeholder="Search tasks…" value={search} onChange={(e) => setSearch(e.target.value)} /><kbd>⌘ K</kbd></label><span className="toolbar-divider" /><div className="filter-select-wrap"><Users size={15} /><select aria-label="Filter by assignee" value={filterAssignee} onChange={(e) => setFilterAssignee(e.target.value)}><option value="all">All assignees</option>{board.members.map((member) => <option key={member.id} value={String(member.id)}>{member.name}</option>)}</select><ChevronDown size={13} /></div><div className="filter-select-wrap"><ListFilter size={15} /><select aria-label="Filter by label" value={filterLabel} onChange={(e) => setFilterLabel(e.target.value)}><option value="all">All labels</option>{allLabels.map((label) => <option key={label} value={label}>{label}</option>)}</select><ChevronDown size={13} /></div><button className={`overdue-filter ${onlyOverdue ? 'overdue-filter-active' : ''}`} onClick={() => setOnlyOverdue(!onlyOverdue)}><Clock3 size={14} /> Overdue{overdueCount > 0 && <span>{overdueCount}</span>}</button></div><div className="board-toolbar-right"><span className="visible-count">{visibleCount} of {allCards.length} tasks</span><button className={`icon-button ${columnsMenu ? 'icon-button-active' : ''}`} title="Column options" onClick={() => setColumnsMenu(!columnsMenu)}><Settings2 size={17} /></button>{columnsMenu && <div className="columns-popover"><strong>Manage columns</strong><p>Owners can rename or remove empty columns. Use the arrows on each column to reorder.</p><button onClick={() => { setColumnsMenu(false); addColumn(); }}><Plus size={15} /> Add a column</button></div>}</div></section>
+        <section className="board-toolbar"><div className="board-filters"><label className="search-box"><Search size={16} /><input aria-label="Search tasks" placeholder="Search tasks…" value={search} onChange={(e) => setSearch(e.target.value)} /></label><span className="toolbar-divider" /><div className="filter-select-wrap"><Users size={15} /><select aria-label="Filter by assignee" value={filterAssignee} onChange={(e) => setFilterAssignee(e.target.value)}><option value="all">All assignees</option>{board.members.map((member) => <option key={member.id} value={String(member.id)}>{member.name}</option>)}</select><ChevronDown size={13} /></div><div className="filter-select-wrap"><ListFilter size={15} /><select aria-label="Filter by label" value={filterLabel} onChange={(e) => setFilterLabel(e.target.value)}><option value="all">All labels</option>{allLabels.map((label) => <option key={label} value={label}>{label}</option>)}</select><ChevronDown size={13} /></div><button className={`overdue-filter ${onlyOverdue ? 'overdue-filter-active' : ''}`} onClick={() => setOnlyOverdue(!onlyOverdue)}><Clock3 size={14} /> Overdue{overdueCount > 0 && <span>{overdueCount}</span>}</button></div><div className="board-toolbar-right"><span className="visible-count">{visibleCount} of {allCards.length} tasks</span><button className={`icon-button ${columnsMenu ? 'icon-button-active' : ''}`} title="Column options" onClick={() => setColumnsMenu(!columnsMenu)}><Settings2 size={17} /></button>{columnsMenu && <div className="columns-popover"><strong>Manage columns</strong><p>Owners can rename or remove empty columns. Use the Move left / Move right buttons under each column to reorder them.</p><button onClick={() => { setColumnsMenu(false); setColumnModal({ mode: 'add' }); }}><Plus size={15} /> Add a column</button></div>}</div></section>
 
         <div className={`board-and-activity ${showActivity ? 'with-activity' : ''}`}>
           <section className="board-scroll-area" aria-label="Kanban board">
@@ -546,29 +819,39 @@ function App() {
                   if (search && !`${card.title} ${card.description}`.toLowerCase().includes(search.toLowerCase())) return false;
                   if (filterAssignee !== 'all' && String(card.assigneeId || '') !== filterAssignee) return false;
                   if (filterLabel !== 'all' && !(card.labels || []).includes(filterLabel)) return false;
-                  if (onlyOverdue && !(card.dueDate && card.dueDate < new Date().toISOString().slice(0, 10) && column.name.toLowerCase() !== 'done')) return false;
+                  if (onlyOverdue && !isOverdue(card.dueDate, column.name)) return false;
                   return true;
                 });
-                return <section className="kanban-column" key={column.id} onDragOver={(event) => event.preventDefault()} onDrop={(event) => handleCardDrop(event, column)}>
-                  <header className="column-header"><div className="column-title-group"><span className={`column-indicator indicator-${index % 4}`} /><h2>{column.name}</h2><span className="column-count">{visibleCards.length}</span></div><div className="column-actions"><button className="column-icon-action" onClick={() => { setNewCardColumnId(column.id); setActiveCard(null); }} title={`Add task to ${column.name}`}><Plus size={16} /></button>{board.role === 'owner' && <button className="column-icon-action column-menu-button" title="Column options" onClick={() => { const action = window.prompt(`Column “${column.name}”\nType: rename, delete, or cancel`, 'rename'); if (action?.toLowerCase() === 'rename') renameColumn(column); if (action?.toLowerCase() === 'delete') deleteColumn(column); }}><MoreHorizontal size={17} /></button>}</div></header>
+                const isTouchTarget = touchDrag?.overColumnId === column.id;
+                return <section className={`kanban-column ${isTouchTarget ? 'column-touch-target' : ''}`} data-column-id={column.id} key={column.id} onDragOver={(event) => event.preventDefault()} onDrop={(event) => handleCardDrop(event, column)}>
+                  <header className="column-header"><div className="column-title-group"><span className={`column-indicator indicator-${index % 4}`} /><h2>{column.name}</h2><span className="column-count">{visibleCards.length}</span></div><div className="column-actions"><button className="column-icon-action" onClick={() => { setNewCardColumnId(column.id); setActiveCard(null); }} title={`Add task to ${column.name}`}><Plus size={16} /></button>{board.role === 'owner' && <button className="column-icon-action column-menu-button" title="Column options" onClick={() => setColumnModal({ mode: 'edit', columnId: column.id })}><MoreHorizontal size={17} /></button>}</div></header>
                   <div className="column-subhead"><span>{index === 0 ? 'UP NEXT' : index === board.columns.length - 1 ? 'COMPLETED WORK' : 'IN MOTION'}</span>{index === board.columns.length - 1 && <CheckCircle2 size={13} />}</div>
                   <div className={`column-cards ${draggingCard ? 'column-drag-active' : ''}`} onDragOver={(event) => event.preventDefault()} onDrop={(event) => handleCardDrop(event, column)}>
-                    {visibleCards.map((card) => <Card key={card.id} card={card} column={column} isDragging={draggingCard?.card.id === card.id} onOpen={(item, columnId) => { setActiveCard(item); setNewCardColumnId(columnId); }} onDragStart={(event, item, sourceColumn) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', String(item.id)); setDraggingCard({ card: item, column: sourceColumn }); }} onDragEnd={() => setDraggingCard(null)} onDrop={handleCardDrop} />)}
+                    {visibleCards.map((card) => <Card key={card.id} card={card} column={column} coarsePointer={coarsePointer} onGripPointerDown={startTouchDrag} dropBefore={isTouchTarget && touchDrag.beforeCardId === card.id} isDragging={draggingCard?.card.id === card.id} onOpen={(item, columnId) => { setActiveCard(item); setNewCardColumnId(columnId); }} onDragStart={(event, item, sourceColumn) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', String(item.id)); setDraggingCard({ card: item, column: sourceColumn }); }} onDragEnd={() => setDraggingCard(null)} onDrop={handleCardDrop} />)}
+                    {isTouchTarget && touchDrag.beforeCardId === null && visibleCards.length > 0 && <div className="drop-end-indicator" />}
                     {visibleCards.length === 0 && <div className={`column-empty ${draggingCard ? 'column-empty-drag' : ''}`}><div className="empty-symbol">{draggingCard ? <ArrowDownUp size={18} /> : index === board.columns.length - 1 ? <CheckCircle2 size={18} /> : <Sparkles size={17} />}</div><span>{draggingCard ? 'Drop to move here' : search || filterAssignee !== 'all' || filterLabel !== 'all' || onlyOverdue ? 'No matching tasks' : 'Nothing here just yet'}</span></div>}
                   </div>
                   <button className="add-card-button" onClick={() => { setNewCardColumnId(column.id); setActiveCard(null); }}><Plus size={15} /> Add a task</button>
                   {board.role === 'owner' && <div className="column-reorder"><button disabled={index === 0} title="Move column left" onClick={() => nudgeColumn(index, -1)}><ChevronLeft size={12} /> Move left</button><button disabled={index === board.columns.length - 1} title="Move column right" onClick={() => nudgeColumn(index, 1)}>Move right <ChevronRight size={12} /></button></div>}
                 </section>;
               })}
-              {board.role === 'owner' && <button className="add-column-tile" onClick={addColumn}><span><Plus size={17} /></span><strong>Add column</strong><small>Shape your workflow</small></button>}
+              {board.role === 'owner' && <button className="add-column-tile" onClick={() => setColumnModal({ mode: 'add' })}><span><Plus size={17} /></span><strong>Add column</strong><small>Shape your workflow</small></button>}
             </div>
-            <div className="board-bottom-note"><span><ShieldCheck size={14} /> Private to this team</span><span>Drag cards to update their status <ArrowRight size={13} /></span></div>
+            <div className="board-bottom-note"><span><ShieldCheck size={14} /> Private to this team</span><span>{coarsePointer ? 'Hold a card’s dotted handle to drag it' : 'Drag cards to update their status'} <ArrowRight size={13} /></span></div>
           </section>
           {showActivity && <ActivityPanel activity={activity} onClose={() => setShowActivity(false)} />}
         </div>
       </> : <section className="empty-workspace"><div className="empty-workspace-art"><div className="empty-art-card"><span /><span /><span /></div><div className="empty-art-card empty-art-card-two"><span /><span /></div><div className="empty-art-check"><Check size={24} /></div></div><span className="eyebrow eyebrow-muted">A FRESH START</span><h1>{projects.length ? 'Choose a project to begin' : 'Make room for good work.'}</h1><p>{projects.length ? 'Select a project from the sidebar to open its board.' : 'Create your first project, add your teammates, and turn the big things into small, movable steps.'}</p><button className="primary-button" onClick={() => setShowProjectModal(true)}><Plus size={16} /> Create your first project</button></section>}
     </main>
 
+    {columnModal && (() => {
+      const editing = columnModal.mode === 'edit' ? board?.columns.find((item) => item.id === columnModal.columnId) : null;
+      if (columnModal.mode === 'edit' && !editing) return null;
+      return <ColumnModal mode={columnModal.mode} column={editing} onClose={() => setColumnModal(null)}
+        onSubmit={(name) => (editing ? renameColumn(editing, name) : addColumn(name))} onDelete={() => deleteColumn(editing)} />;
+    })()}
+    {showHelp && <HelpModal coarsePointer={coarsePointer} onClose={() => setShowHelp(false)} />}
+    {touchDrag && <div className="touch-ghost" style={{ left: touchDrag.x - touchDrag.offsetX, top: touchDrag.y - touchDrag.offsetY, width: touchDrag.width }}>{touchDrag.title}</div>}
     {showProjectModal && <ProjectModal onClose={() => setShowProjectModal(false)} onCreate={createProject} />}
     {showTeam && board && <TeamModal projectId={selectedProjectId} board={board} onClose={() => setShowTeam(false)} onRefresh={async () => { await refreshBoard(true); await refreshActivity(); await refreshProjects(); }} notify={notify} />}
     {(activeCard || newCardColumnId) && board && <CardModal key={activeCard?.id || `new-${newCardColumnId}`} card={activeCard} projectId={selectedProjectId} defaultColumnId={newCardColumnId} columns={board.columns} members={board.members} onClose={() => { setActiveCard(null); setNewCardColumnId(null); }} onSaved={async () => { await refreshBoard(true); await refreshActivity(); await refreshProjects(); }} notify={notify} />}
