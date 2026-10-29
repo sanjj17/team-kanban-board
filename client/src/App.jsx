@@ -9,7 +9,7 @@ import {
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
-  const activeToken = options.token ?? localStorage.getItem('kanban-token');
+  const activeToken = options.token ?? sessionStorage.getItem('kanban-token');
   if (activeToken) headers.Authorization = `Bearer ${activeToken}`;
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
   const response = await fetch(`/api${path}`, {
@@ -418,7 +418,7 @@ function TeamModal({ projectId, board, onClose, onRefresh, notify }) {
 }
 
 function App() {
-  const [token, setToken] = useState(() => localStorage.getItem('kanban-token'));
+  const [token, setToken] = useState(() => sessionStorage.getItem('kanban-token'));
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [projects, setProjects] = useState([]);
@@ -461,7 +461,7 @@ function App() {
   useEffect(() => {
     if (!token) { setUser(null); setAuthReady(true); return; }
     api('/auth/me').then(({ user: currentUser }) => { setUser(currentUser); setAuthReady(true); }).catch(() => {
-      localStorage.removeItem('kanban-token'); setToken(null); setUser(null); setAuthReady(true);
+      sessionStorage.removeItem('kanban-token'); setToken(null); setUser(null); setAuthReady(true);
     });
   }, [token]);
 
@@ -527,7 +527,7 @@ function App() {
         setSyncState('live');
       } catch (err) {
         if (cancelled) return;
-        if (err.status === 401) { localStorage.removeItem('kanban-token'); setToken(null); setUser(null); }
+        if (err.status === 401) { sessionStorage.removeItem('kanban-token'); setToken(null); setUser(null); }
         else if (err.status === 404) { notify('You no longer have access to that project.', 'error'); setSelectedProjectId(null); refreshProjects(); }
         else setSyncState('offline');
       }
@@ -551,13 +551,13 @@ function App() {
   }, [user, token, inviteToken, notify, refreshProjects, refreshBoard]);
 
   function onAuth(result) {
-    localStorage.setItem('kanban-token', result.token);
+    sessionStorage.setItem('kanban-token', result.token);
     setToken(result.token);
     setUser(result.user);
   }
 
   function logout() {
-    localStorage.removeItem('kanban-token');
+    sessionStorage.removeItem('kanban-token');
     setToken(null); setUser(null); setBoard(null); setActivity([]); setShowActivity(false); setShowTeam(false);
     lastBoardJson.current = ''; lastActivityJson.current = '';
     notify('You have signed out.');
